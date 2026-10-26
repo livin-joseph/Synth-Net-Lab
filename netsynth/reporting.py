@@ -100,69 +100,109 @@ def structure_function_points(res) -> pd.DataFrame:
 
 @dataclass
 class Tolerances:
-    """What 'close enough' means. Defaults are rules of thumb - tune them to your use case."""
-    portrait_divergence: float = 0.35
+    """What 'close enough' means. Defaults are rules of thumb - tune them to your use case.
+
+    Epidemic tolerances are never applied tighter than the real network's own run-to-run noise (the noise floor):
+    a generator cannot be required to match the real epidemic better than the real network matches itself.
+    """
+    degree_ks: float = 0.25             # Kolmogorov-Smirnov distance between degree distributions
     final_size_abs: float = 0.05        # absolute difference in attack rate (5 percentage points)
     peak_rel: float = 0.25
     curve_nrmse: float = 0.20
     outbreak_prob_abs: float = 0.15
-    max_edge_overlap: float = 0.25      # share of synthetic edges that are real edges
+    max_leak_excess: float = 0.25       # share of synthetic edges that are real edges, beyond chance (see leak_excess)
 
 
-def verdicts(res, tol: Tolerances) -> pd.DataFrame:
-    """Per generator: each check (value, threshold, pass) and an overall verdict."""
+def _num(x):
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return np.nan
+    return x
+
+
+def leak_excess(overlap, ratio_to_chance):
+    """Edge overlap above chance, rescaled to 0..1:  (overlap - chance) / (1 - chance).
+
+    ``chance`` is the overlap a random graph would have (the real density); it is recovered from the exported
+    'overlap vs chance' ratio. 0 = no more real edges than luck gives, 1 = every synthetic edge is a real edge.
+    """
+    overlap, ratio = _num(overlap), _num(ratio_to_chance)
+    if not (np.isfinite(overlap) and np.isfinite(ratio)) or ratio <= 0:
+        return np.nan
+    chance = min(overlap / ratio, 0.999)
+    return max(0.0, (overlap - chance) / (1.0 - chance))
+
+
+def effective_tolerances(b, tol: Tolerances) -> dict:
+    """User tolerances, raised to the real-vs-real noise floor where the floor is higher."""
+    fl = b.floor or {}
+    def eff(t, key):
+        f = _num(fl.get(key))
+        return max(t, f) if np.isfinite(f) else t
+    return {"degree_ks": tol.degree_ks, "final_size": eff(tol.final_size_abs, "final_size_err"), "peak": eff(tol.peak_rel, "peak_err_rel"),
+            "curve": eff(tol.curve_nrmse, "curve_nrmse"), "outbreak": eff(tol.outbreak_prob_abs, "outbreak_prob_err")}
+
+
+def verdicts(b, tol: Tolerances) -> pd.DataFrame:
+    """Per generator: each check (value, threshold) and an overall verdict. Works on a ResultBundle.
+
+    safe for simulation = degree distribution close AND the four epidemic errors within tolerance;
+    safe for sharing    = safe for simulation AND not copying real edges beyond the leakage tolerance.
+    Portrait divergence is reported but is not a gate: on the bundled networks it did not predict epidemic error.
+    """
+    et = effective_tolerances(b, tol)
     rows = []
-    for k, r in ok_reports(res).items():
-        pdm = _ms(r.pd)[0]
-        ov = _ms(r.overlap)[0]
-        c = r.sir_cmp
-        checks = [
-            ("Structure: portrait divergence", pdm, tol.portrait_divergence, True) if r.pd else None,
-            ("Epidemic: final-size error", c["final_size_err"], tol.final_size_abs, True),
-            ("Epidemic: peak error (rel.)", c["peak_err_rel"], tol.peak_rel, True),
-            ("Epidemic: curve NRMSE", c["curve_nrmse"], tol.curve_nrmse, True),
-            ("Epidemic: outbreak-prob. error", c["outbreak_prob_err"], tol.outbreak_prob_abs, True),
-        ]
-        sim_checks = [x for x in checks if x]
-        sim_pass = all(v <= t for _, v, t, _ in sim_checks)
-        leak = None if not np.isfinite(ov) else ov
-        share_pass = sim_pass and (leak is None or leak <= tol.max_edge_overlap)
-        rows.append({
-            "Generator": r.label,
-            "simulation_ok": sim_pass,
-            "sharing_ok": share_pass,
-            "leak": leak,
-            "failed": [n for n, v, t, _ in sim_checks if v > t] + (["Leakage: edge overlap"] if leak is not None and leak > tol.max_edge_overlap else []),
-            "checks": sim_checks,
-        })
+    for g in b.generators:
+        lab = g["label"]
+        if lab not in b.epidemic.index or lab not in b.fidelity.index:
+            continue
+        e, f = b.epidemic.loc[lab], b.fidelity.loc[lab]
+        checks = []
+        dks = _num(f.get("Degree KS"))
+        if np.isfinite(dks):
+            checks.append(("Structure: degree distribution (KS)", dks, et["degree_ks"], True))
+        checks += [("Epidemic: final-size error", _num(e["Δ final size"]), et["final_size"], True),
+                   ("Epidemic: peak error (rel.)", _num(e["Peak err (rel.)"]), et["peak"], True),
+                   ("Epidemic: curve NRMSE", _num(e["Curve NRMSE"]), et["curve"], True),
+                   ("Epidemic: outbreak-prob. error", _num(e["Outbreak-prob err"]), et["outbreak"], True)]
+        sim_pass = all(v <= t for _, v, t, _ in checks)
+        ov = _num(f.get("Edge overlap with real"))
+        ex = leak_excess(ov, f.get("Overlap vs chance (×)"))
+        leak = ov if np.isfinite(ov) else None
+        leak_fail = np.isfinite(ex) and ex > tol.max_leak_excess
+        share_pass = sim_pass and not leak_fail
+        rows.append({"Generator": lab, "simulation_ok": sim_pass, "sharing_ok": share_pass, "leak": leak,
+                     "leak_excess": ex if np.isfinite(ex) else None,
+                     "failed": [n for n, v, t, _ in checks if v > t] + (["Leakage: real edges copied"] if leak_fail else []),
+                     "checks": checks})
     return pd.DataFrame(rows).set_index("Generator")
 
 
-def takeaways(res, tol: Tolerances) -> list:
+def takeaways(b, tol: Tolerances) -> list:
     """Plain-language findings derived from the numbers (no hand-written conclusions)."""
     out = []
-    ok = ok_reports(res)
-    bad = {k: r for k, r in res.reports.items() if not r.ok}
-    for k, r in bad.items():
-        out.append(f"⚠️ **{r.label}** failed ({r.error}); the remaining generators are unaffected.")
-    if not ok:
+    for k, err in b.failed.items():
+        out.append(f"⚠️ **{k}** failed ({err}); the remaining generators are unaffected.")
+    if not b.generators:
         return out
-    fid = fidelity_table(res)
-    if fid["Portrait divergence"].notna().any():
-        b = fid["Portrait divergence"].idxmin()
-        out.append(f"**Closest in structure:** {b} (portrait divergence {fid.loc[b, 'Portrait divergence']:.3f}).")
-    sir = {r.label: r.sir_cmp["curve_nrmse"] for r in ok.values()}
-    b = min(sir, key=sir.get)
-    out.append(f"**Closest epidemic behaviour:** {b} (outbreak-curve NRMSE {sir[b]:.2f}; "
-               f"sampling-noise floor of the real network ≈ {res.floor.get('curve_nrmse', float('nan')):.2f}).")
-    pts = structure_function_points(res)
-    if len(pts) >= 6 and pts["Portrait divergence"].notna().all():
+    fid = b.fidelity
+    if "Portrait divergence" in fid and fid["Portrait divergence"].notna().any():
+        best = fid["Portrait divergence"].idxmin()
+        out.append(f"**Closest in structure:** {best} (portrait divergence {fid.loc[best, 'Portrait divergence']:.3f}).")
+    curve = b.epidemic.drop(index="Real", errors="ignore")["Curve NRMSE"].dropna()
+    if len(curve):
+        best = curve.idxmin()
+        out.append(f"**Closest epidemic behaviour:** {best} (outbreak-curve NRMSE {curve[best]:.2f}; "
+                   f"sampling-noise floor of the real network ≈ {b.floor.get('curve_nrmse', float('nan')):.2f}).")
+    sf = b.sf
+    if len(sf) >= 6 and "Portrait divergence" in sf and sf["Portrait divergence"].notna().all():
         from scipy.stats import spearmanr
-        rho, p = spearmanr(pts["Portrait divergence"], pts["Curve NRMSE"])
+        rho, p = spearmanr(sf["Portrait divergence"], sf["Curve NRMSE"])
         if np.isfinite(rho):
             out.append(f"**Does structure predict function?** Across all synthetic graphs, portrait divergence and "
                        f"epidemic-curve error have Spearman ρ = {rho:.2f} (p = {p:.2g}).")
-    v = verdicts(res, tol)
+    v = verdicts(b, tol)
     sim = [g for g in v.index if v.loc[g, "simulation_ok"]]
     shr = [g for g in v.index if v.loc[g, "sharing_ok"]]
     leaky = [g for g in sim if g not in shr]

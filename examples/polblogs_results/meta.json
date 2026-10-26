@@ -1,0 +1,76 @@
+{
+  "name": "polblogs",
+  "version": 2,
+  "created": "2026-10-25 21:06:26",
+  "n": 1222,
+  "m": 16714,
+  "real_density": 0.022403894744320276,
+  "real_scalars": {
+    "n": 1222,
+    "m": 16714,
+    "density": 0.022403894744320276,
+    "mean_degree": 27.355155482815057,
+    "max_degree": 351.0,
+    "degree_second_moment": 2222.9770867430443,
+    "avg_clustering": 0.3202546194373154,
+    "transitivity": 0.2259585173589758,
+    "assortativity": -0.22132872301192266,
+    "aspl": 2.7554873054873057,
+    "diameter": 8.0,
+    "lcc_fraction": 1.0,
+    "n_triangles": 101043,
+    "n_components": 1
+  },
+  "beta": 0.024917910586832147,
+  "beta_c": 0.012458955293416073,
+  "beta_mult": 2.0,
+  "gamma": 1.0,
+  "init_frac": 0.01,
+  "runs_per_graph": 40,
+  "k": 5,
+  "seed": 0,
+  "big_outbreak": 0.05,
+  "floor": {
+    "final_size_err": 0.007757774140752877,
+    "final_size_wasserstein": 0.008101472995090012,
+    "peak_err_rel": 0.0385473726922297,
+    "tpeak_err_rel": 0.0313192027839289,
+    "curve_nrmse": 0.03404157236638966,
+    "outbreak_prob_err": 0.030000000000000027
+  },
+  "seconds": 167.59457217499994,
+  "generators": [
+    {
+      "key": "er",
+      "label": "Erd\u0151s\u2013R\u00e9nyi"
+    },
+    {
+      "key": "ba",
+      "label": "Barab\u00e1si\u2013Albert"
+    },
+    {
+      "key": "cm",
+      "label": "Configuration model"
+    },
+    {
+      "key": "netgan",
+      "label": "NetGAN"
+    },
+    {
+      "key": "syng_r",
+      "label": "SyNGLER (SyNG-R)"
+    },
+    {
+      "key": "syng_d_mlp",
+      "label": "SyNGLER (SyNG-D, MLP)"
+    }
+  ],
+  "node_map_kind": {
+    "er": "identity",
+    "ba": "identity",
+    "cm": "identity",
+    "netgan": "identity",
+    "syng_r": "bootstrap",
+    "syng_d_mlp": "none"
+  }
+}

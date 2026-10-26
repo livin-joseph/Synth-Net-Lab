@@ -68,14 +68,16 @@ The classical baselines have no dependencies beyond NetworkX, so a complete comp
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  app.py  — Streamlit dashboard (sidebar inputs, 7 result tabs)        │
+│  app.py  — Streamlit dashboard (sidebar inputs, 6 result tabs)        │
 │  scripts/run_experiment.py — command-line runner                      │
 └───────────────┬──────────────────────────────────────────────────────┘
                 │ ExperimentConfig                       ▲ ExperimentResult
 ┌───────────────▼────────────────────────────────────────┴─────────────┐
 │  netsynth/pipeline.py      orchestration                              │
-│  netsynth/reporting.py     tables, verdict, key findings              │
-│  netsynth/plots.py         Plotly figure builders                     │
+│  netsynth/bundle.py        ResultBundle: save / load / export         │
+│  netsynth/reporting.py     verdicts, key findings                     │
+│  netsynth/plots.py         Plotly figure builders (from a bundle)     │
+│  netsynth/netviz.py        interactive network views (pyvis)          │
 │  netsynth/benchmark.py     scalability benchmark                      │
 └──────┬──────────────┬───────────────────┬─────────────────┬──────────┘
        │              │                   │                 │
@@ -99,25 +101,27 @@ The classical baselines have no dependencies beyond NetworkX, so a complete comp
 
 | Path | Responsibility |
 |---|---|
-| `app.py` | Streamlit UI: inputs, run button, progress bar, tabs, downloads. Contains no analysis logic. |
+| `app.py` | Streamlit UI: two modes (*Run an experiment* / *Open saved results*), progress bar, six result tabs, downloads. Contains no analysis logic; every tab reads a `ResultBundle`. |
 | `netsynth/io.py` | Parse many file formats into a NetworkX graph; clean the graph (`prepare_graph`); list/load bundled example networks. |
-| `netsynth/sampling.py` | `snowball_sample`: randomised-BFS sub-sampling used for the node cap and for the scalability benchmark. |
+| `netsynth/sampling.py` | `snowball_nodes` / `snowball_sample`: randomised-BFS sub-sampling used for the node cap, the scalability benchmark and the network views of large graphs. |
 | `netsynth/generators/base.py` | `GeneratorResult` dataclass and `graph_from_edges`. The common return type of all generators. |
 | `netsynth/generators/classical.py` | ER, BA and configuration-model generators. |
 | `netsynth/generators/netgan.py` | PyTorch NetGAN: walk sampler, generator, critic, WGAN-GP training loop, score matrix, graph assembly. |
 | `netsynth/generators/syngler_gen.py` | Adapters that expose the SyNGLER variants through the common generator interface. |
-| `netsynth/structure.py` | Scalar structural summaries, error definitions, degree/clustering distribution distances, edge overlap. |
+| `netsynth/structure.py` | Scalar structural summaries, error definitions, degree/clustering distribution distances, edge overlap; per-node profiles and pooled profiles over several graphs (`pooled_profile`) for the distribution plots. |
 | `netsynth/portrait.py` | Fast portrait computation and the portrait divergence. |
 | `netsynth/epidemic.py` | SIR simulation with EoN, epidemic threshold, curve alignment on a common time grid, functional error metrics, noise floor. |
 | `netsynth/pipeline.py` | `run_experiment`: runs everything for one real network and returns an `ExperimentResult`. |
-| `netsynth/reporting.py` | Result tables, `Tolerances`, `verdicts`, `takeaways`. |
-| `netsynth/plots.py` | All charts, with a fixed colour per generator. |
+| `netsynth/bundle.py` | `ResultBundle`: one object holding everything the dashboard shows (tables, per-graph metrics, epidemic curves and runs, diagnostics, graphs, node maps). Built from a fresh `ExperimentResult` (`bundle_from_result`) or loaded from a ZIP, a folder or uploaded files (`bundle_from_zip`, `bundle_from_dir`, `bundle_from_files`); written with `bundle_to_zip` / `write_dir`. |
+| `netsynth/reporting.py` | Result tables, `Tolerances`, `verdicts` and `takeaways` (the last two take a bundle). |
+| `netsynth/plots.py` | The dashboard's charts, each taking a bundle, with a fixed colour per generator. |
+| `netsynth/netviz.py` | Interactive pyvis network pages (`network_html`), node colouring modes, copied-edge highlighting and `viz_subgraph` (snowball sample above the node limit). |
 | `netsynth/benchmark.py` | `scaling_benchmark` and `scaling_exponents`. |
 | `syngler/` | The SyNGLER implementation (see [§4.6](#46-syngler)). |
 | `third_party/` | Third-party portrait-divergence routine used for the divergence formula, and the licence texts of bundled components. |
 | `tests/test_core.py` | Automated tests (see [§14](#14-testing-and-validation)). |
 | `data/samples/` | Bundled example networks (edge lists). |
-| `examples/` | CSV output of a complete run on one of the examples. |
+| `examples/` | Two ready-to-open result bundles (`*.zip`, for *Open saved results*) and the CSV/JSON output of the political-blogs run in `polblogs_results/`. |
 
 ### 2.3 Data flow of one experiment
 
@@ -168,6 +172,7 @@ SyNGLER variants share one fitted latent space model per experiment (`shared_fit
 | `ExperimentConfig` | `pipeline.py` | generator list, `k`, seed, generator parameters, SIR parameters, `compute_portrait`. |
 | `GenReport` | `pipeline.py` | per generator: summaries, per-graph metric errors, degree distances, clustering KS, portrait divergences, edge overlaps, pooled SIR statistics and their comparison to the real network. |
 | `ExperimentResult` | `pipeline.py` | real graph, real summary and portrait, SIR config, β_c, time grid, real SIR statistics, noise floor, reports, wall-clock time. |
+| `ResultBundle` | `bundle.py` | `meta` (settings, real-network scalars, β, β_c, node-map kinds), `generators` (key, label), `scalar`, `errors`, `fidelity`, `epidemic`, `timing`, `sf` (structure-vs-function) tables, `per_graph`, `curves`, `runs`, `floor`, `diagnostics`, `failed`, and optionally `real` and `graphs` / `node_maps`. Tables are indexed by generator label. |
 | `Tolerances` | `reporting.py` | thresholds used by the verdict. |
 | `LSMFit` | `syngler/fit.py` | `Z`, `alpha`, `rho`, `r`, `n`, observed `density`, loss curves, convergence flags, seconds. |
 | `SyntheticSample` | `syngler/api.py` | `n`, `edges` (m×2 array, u<v), `node_map`, `seconds`. |
@@ -258,7 +263,7 @@ output: one-hot walk (T × n)
 
 **Objective.** Wasserstein GAN with gradient penalty (λ = 10): the critic minimises `E[D(fake)] − E[D(real)] + λ·E[(‖∇D(x̂)‖₂ − 1)²]` on random interpolates `x̂` between real and generated one-hot walks; the generator minimises `−E[D(fake)]`. `n_critic = 3` critic steps per generator step, batch size 64, Adam (lr 3·10⁻⁴, β = (0.5, 0.9)).
 
-**Stopping.** Fixed iteration budget (default 600) *or* a wall-clock cap (default 300 s), whichever comes first. There is no early stopping on edge overlap. Every `eval_every = 50` iterations the **walk validity** is logged: the share of generated steps that follow an edge of the real graph (a random generator scores ≈ the graph density). It is displayed in *Diagnostics & export* together with the critic loss.
+**Stopping.** Fixed iteration budget (default 600) *or* a wall-clock cap (default 300 s), whichever comes first. There is no early stopping on edge overlap. Every `eval_every = 50` iterations the **walk validity** is logged: the share of generated steps that follow an edge of the real graph (a random generator scores ≈ the graph density). It is displayed in *Data & downloads* together with the critic loss.
 
 **Sampling a graph.**
 
@@ -333,6 +338,20 @@ Each phase stops early when the relative change of the loss falls below `rtol = 
 #### Node map for SyNG-R
 
 For graph *b*, `idx = rng.integers(0, n, n)`; synthetic node *i* is a bootstrap copy of real node `idx[i]`. The array `idx` is stored as `node_map`, which allows the leakage metric ([§8.2](#82-edge-overlap-leakage)). SyNG-D samplers draw latents from a learned distribution without any correspondence, so their node map is `None` and leakage is reported as *n/a*.
+
+#### Privacy noise for SyNG-R
+
+A latent space model fitted to a small graph can be nearly deterministic: with a handful of nodes and `r = 6` dimensions it assigns probabilities close to 1 to the real edges and close to 0 elsewhere, so resampling reproduces the real graph (on Les Misérables and the karate club, plain SyNG-R reproduces 95–98 % of the real edges). To control this, `SyNGLER.sample(..., latent_noise=σ)` jitters each resampled latent vector and node intercept,
+
+```
+Z'_i = (Z_{φ(i)} + σ · sd(Z) · ε_i) / √(1 + σ²) ,     α'_i = (α_{φ(i)} + σ · sd(α) · ε'_i) / √(1 + σ²) ,     ε, ε' ~ N(0, 1)
+```
+
+where `sd` is the spread of the fitted values, and **re-calibrates ρ** for every graph so that the expected density equals the real density (Brent root-finding, as in the fit). `σ = 0` is plain SyNG-R. The factor `1/√(1+σ²)` keeps the variance of the latents unchanged, so the noise blurs *which* nodes connect without inflating the spread of node propensities; without it, large σ widens the degree distribution and the epidemic becomes far too strong (on Les Misérables, σ = 2 without the factor gives degree KS 0.97 and an epidemic-curve error about 50× the noise floor; with it, 0.13 and about the noise floor).
+
+In the experiment pipeline `σ` is **chosen automatically**: `tune_latent_noise` scans `σ ∈ {0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3}` and takes the smallest value for which the mean edge overlap of a few probe graphs, measured above chance ([§8.2](#82-edge-overlap-leakage)), is at most the *copied-edge target* (default 0.25, the verdict's leakage tolerance) times a margin (0.65 up to 100 nodes, 0.8 up to 300, 0.95 above) that absorbs the noisier estimate of small graphs. Several probes are averaged (16, 8, 4 or 2 depending on size) because the overlap of a small graph varies by about ±0.08 from draw to draw. If even σ = 3 misses the target it is used anyway. The tuned σ and the probe measurement are stored in `diagnostics.json` and shown on the *Overview* tab.
+
+Measured excess overlap (above chance) at several σ, 12 graphs each: Les Misérables 0.31 / 0.17 / 0.09 at σ = 1 / 1.5 / 2 with degree KS 0.12 throughout; karate club 0.48 / 0.33 / 0.25 / 0.17 at σ = 1 / 1.5 / 2 / 3 with degree KS ≈ 0.2. Clustering is the structural property that suffers (clustering KS rises, for example, from 0.07 to 0.24 on political blogs at σ = 1 and to about 0.35 on Les Misérables), and the trade-off is real: a very small graph may not reach the target without degrading, in which case the dashboard reports what it finds rather than hiding it.
 
 #### The `SyNGLER` class
 
@@ -436,7 +455,7 @@ D_JS(G, H) = ½ KL(P ‖ M) + ½ KL(Q ‖ M),          KL measured with log base
 | Sensitivity | degree distribution, path-length distribution, neighbourhood growth, diameter, component sizes |
 | Insensitivity | node labelling; it needs no node alignment |
 
-It is used in the dashboard as the **single structural similarity score** (*Portrait divergence* tab and *Verdict*).
+It is used in the dashboard as the **single structural similarity score** (*Portrait divergence* tab and *Overview*).
 
 ### 6.4 Implementation (`netsynth/portrait.py`)
 
@@ -503,13 +522,13 @@ Computed between the pooled synthetic runs and the real runs:
 
 ### 7.6 Noise floor
 
-Even the real network does not reproduce its own epidemic exactly, because the process is stochastic. The **noise floor** randomly splits the real runs into two halves and computes the same error metrics between the halves. It is displayed as a reference in the *Verdict* and *Epidemics* tabs: tolerances much tighter than the floor cannot be met by chance. Because each half has only half the runs, the floor is slightly pessimistic relative to a comparison with all runs.
+Even the real network does not reproduce its own epidemic exactly, because the process is stochastic. The **noise floor** randomly splits the real runs into two halves and computes the same error metrics between the halves. It is displayed as a reference in the *Overview* and *Epidemics* tabs: tolerances much tighter than the floor cannot be met by chance. Because each half has only half the runs, the floor is slightly pessimistic relative to a comparison with all runs.
 
 ### 7.7 Plots
 
 * **Outbreak curves:** mean `I(t)` per network with a 10–90 percentile band across runs.
-* **Final-size distributions:** box plots with means.
-* **Epidemic summary table:** means plus the error metrics above.
+* **Summary bars:** final size, peak prevalence, time to peak and outbreak probability per network, with the real value as a dashed line.
+* **Error bars against the noise floor:** the four functional errors per generator, the real-vs-real noise floor (dotted) and the user's tolerance (dashed).
 
 ---
 
@@ -517,23 +536,31 @@ Even the real network does not reproduce its own epidemic exactly, because the p
 
 ### 8.1 Tolerances and checks
 
-The *Verdict* tab combines structural, functional and leakage checks against tolerances that the user can change. Defaults (`Tolerances` in `reporting.py`) are **rules of thumb**, not standards:
+The *Overview* tab combines structural, functional and leakage checks against tolerances that the user can change. Defaults (`Tolerances` in `reporting.py`) are **rules of thumb**, not standards:
 
 | Check | Value used | Default tolerance |
 |---|---|---|
-| Structure: portrait divergence | mean over the K graphs | ≤ 0.35 |
+| Structure: degree distribution | KS distance, mean over the K graphs | ≤ 0.25 |
 | Epidemic: final-size error | `Δ final size` (absolute) | ≤ 0.05 |
 | Epidemic: peak error | relative | ≤ 0.25 |
 | Epidemic: curve NRMSE | normalised | ≤ 0.20 |
 | Epidemic: outbreak-probability error | absolute | ≤ 0.15 |
-| Leakage: edge overlap | share of synthetic edges that are real | ≤ 0.25 |
+| Leakage: real edges copied beyond chance | `leak_excess` ([§8.2](#82-edge-overlap-leakage)) | ≤ 0.25 |
 
 Per generator:
 
-* **Safe simulation substitute** = the portrait-divergence check *and* all four epidemic checks pass.
+* **Safe simulation substitute** = the degree-distribution check *and* all four epidemic checks pass.
 * **Safe for data sharing** = safe simulation substitute *and* the leakage check passes (or leakage is *n/a* because the generator has no node correspondence — then edge-level leakage cannot be measured and this is stated in the findings).
 
-The *Key findings* list is generated from the numbers: closest generator in structure and in epidemic behaviour, the Spearman correlation between structural and functional error, which generators are safe for simulation/sharing, and which reproduce the dynamics but copy too many edges.
+Three design decisions, each made on evidence rather than to favour a generator:
+
+1. **Structure is judged on the degree distribution; portrait divergence is reported but does not gate.** The degree distribution is what drives an SIR epidemic, and on the bundled political-blogs run portrait divergence was uncorrelated with epidemic error (Spearman ρ ≈ 0). An absolute portrait-divergence cut-off is also not meaningful across networks: on small graphs even the best generator sits near 0.4–0.5, so any fixed threshold either passes everything or nothing.
+2. **Epidemic tolerances are never tighter than the noise floor.** The effective tolerance is `max(tolerance, real-vs-real noise floor)` ([§7.6](#76-noise-floor), `effective_tolerances`). A generator cannot be required to match the real epidemic more closely than the real network matches itself.
+3. **Leakage is measured above chance.** In a dense small graph a random graph already shares many edges with the real one (the karate club has density 0.14), so a raw overlap threshold penalises the graph, not the generator.
+
+The classical baselines are held to the same rules: ER and BA fail the degree-distribution check on every bundled network, so neither is ever reported as a safe substitute.
+
+The *Key findings* list is generated from the numbers: closest generator in structure and in epidemic behaviour, the Spearman correlation between portrait divergence and epidemic error, which generators are safe for simulation/sharing, and which reproduce the dynamics but copy too many edges.
 
 The tolerances should reflect the use case. A sensitivity study with a threshold close to the epidemic's critical point will need a much stricter final-size and outbreak-probability tolerance than a rough what-if analysis.
 
@@ -546,12 +573,13 @@ overlap = mean over synthetic edges (u, v) with φ(u) ≠ φ(v) of  1[ (φ(u), �
 ```
 
 * **Chance level** is the real graph's density; the table also gives `overlap / density` ("× chance").
+* **Excess over chance** (used by the verdict): `leak_excess = (overlap − chance) / (1 − chance)`, 0 for a graph that shares only as many edges as luck would, 1 for a graph made only of real edges.
 * Node maps: identity for ER, BA, CM and NetGAN (the synthetic graph lives on the real node set; for ER and BA the identity map carries no information, so their overlap equals chance and acts as a reference); the bootstrap index vector for SyNG-R; none for SyNG-D.
 * It is a **proxy** for memorisation. It is not a formal privacy guarantee (no differential-privacy accounting, no analysis of de-anonymisation attacks that use structure rather than exact edges).
 
 ### 8.3 Structure ↔ function
 
-`structure_function_points` yields one row per synthetic graph with its portrait divergence, degree KS, final-size error, curve NRMSE and peak error. The *Structure ↔ function* tab plots any pair and reports the Spearman rank correlation. A high correlation would mean that static similarity is a good proxy for dynamical similarity; points far from the trend identify generators whose structure is "wrong in ways that do not matter" (or the reverse).
+`structure_function_points` yields one row per synthetic graph with its portrait divergence, degree KS, final-size error, curve NRMSE and peak error (exported as `structure_vs_function.csv`). The key findings quote the Spearman rank correlation between portrait divergence and curve error over all synthetic graphs: a high value would mean that static similarity is a good proxy for dynamical similarity.
 
 ---
 
@@ -577,32 +605,38 @@ Theoretical expectations (for orientation): LSM fitting costs `O(n²)` per itera
 
 ## 10. Dashboard guide
 
-### 10.1 Sidebar
+The sidebar has two modes.
 
-1. **Real network** — bundled example, file upload, or URL. *Largest component* and *Max nodes* control cleaning (§3.2).
-2. **Generators** — multi-select; a one-line description is shown for each selected generator. *Synthetic graphs per generator* (K) and *Random seed*.
-3. **Settings expanders** — SyNGLER (fit effort preset, latent dimension, MLP steps, forest budget), NetGAN (iterations, time cap, walk length), epidemic (β multiple, γ, initial fraction, runs per graph, outbreak threshold).
-4. **Run experiment**.
+* **Run an experiment** — choose a network (bundled example or uploaded file), the generators and the number of graphs; *Advanced settings* holds the seed, node cap, SyNGLER latent dimension and copied-edge target, NetGAN iterations, epidemic strength and number of simulations. Settings not shown use the defaults of §11.
+* **Open saved results** — open a bundled run or a results ZIP (or the exported CSV/JSON files). The dashboard is rebuilt from the file; nothing is recomputed. Views that need graphs are disabled when the file has none.
 
-A header row shows the cleaned network's size, mean degree, clustering and assortativity, plus the preparation notes. A warning appears when SyNGLER is selected for a network above 3 000 nodes.
+Both modes feed the same `ResultBundle` (§2.5), so a fresh run and a reopened file look identical.
 
-### 10.2 Tabs
+### 10.1 Tabs
 
 | Tab | Contents |
 |---|---|
-| **Verdict** | Per-generator ✔/✘ for simulation and for sharing; tolerance sliders (expander); noise-floor reference; key findings; table of every check. |
-| **Structure** | Degree CCDF (log–log), local-clustering box plots, error heat-map over all scalar metrics, scalar-metric table, degree/clustering distance table. |
-| **Portrait divergence** | Bar chart (mean ± s.d.), side-by-side portrait heat-maps of the real and a selected generator. |
-| **Epidemics** | Mean outbreak curves with percentile bands, final-size distributions, summary and noise-floor reference, epidemic-threshold table. |
-| **Structure ↔ function** | Scatter of structural score vs functional error with Spearman ρ. |
-| **Scalability** | Benchmark controls (sizes, generators, budgets), fit/generation/total timing plots, scaling exponents, timing of the main run. |
-| **Diagnostics & export** | NetGAN critic loss and walk validity, LSM fitting loss, configuration-model edge loss, ZIP download. |
+| **Overview** | A card per generator saying whether it is a safe substitute *for simulation* and *for data sharing*, with the reasons it fails; tolerance sliders; one summary table (degree distance, portrait divergence, final-size and curve error, share of real edges copied, fit time); generated key findings. |
+| **Networks** | Interactive side-by-side views of the real network and a chosen synthetic graph (§10.2). |
+| **Structure** | Scalar metrics against the real value, portrait divergence per generator, degree distribution (CCDF), clustering per node. |
+| **Epidemics** | Mean outbreak curves with percentile bands, summary bars, errors against the noise floor and tolerances. |
+| **Privacy & cost** | Share of synthetic edges that are real edges against chance and tolerance; fit and generation time; scalability benchmark (in an expander). |
+| **Data** | Every exported table, per-table CSV download and the full results ZIP. |
 
-Results persist in the session until the next run. If the loaded network or cleaning options change after a run, a banner reminds that the displayed results belong to the previous setup.
+If the loaded network or settings change after a run, a banner reminds that the displayed results belong to the previous setup.
+
+### 10.2 Network views
+
+The views are **pyvis** (vis-network) pages embedded in the app: drag nodes, zoom, hover for degree and clustering. Node size is proportional to degree.
+
+* **Size limit.** At most 40–300 nodes are drawn (slider, default 200). Larger graphs are shown as a **snowball sample** (breadth-first from a random seed node). Clustering shown under a view describes the drawn graph, so a sample's value is not that of the full network.
+* **Colour** by degree, local clustering, community (greedy modularity) or k-core. Each panel has its own colour scale; the legend states the range.
+* **Same node set.** For generators whose synthetic node *i* is real node *i* (ER, BA, configuration model, NetGAN) the synthetic view shows the subgraph induced on the same nodes as the real view, so the two are directly comparable. Otherwise each graph is sampled independently.
+* **Copied edges.** Edges of the synthetic graph that are also real edges (through the node map, §8.2) are drawn **red**, with their count and share. Not available for SyNG-D, which has no node correspondence.
 
 ### 10.3 Colours
 
-Each generator keeps the same colour in every chart (blue SyNG-R, orange ER, green BA, pink CM, violet NetGAN, red SyNG-D MLP, yellow SyNG-D Forest); the real network is always dark neutral. Colours follow the entity, not its rank, so removing a generator does not repaint the others.
+Each generator keeps the same colour in every chart (blue SyNG-R, orange ER, green BA, pink CM, violet NetGAN, red SyNG-D MLP, yellow SyNG-D Forest); the real network is always dark neutral.
 
 ---
 
@@ -658,19 +692,30 @@ See §4.5. In the UI: iterations (default 600), time cap (300 s), walk length (1
 
 ## 12. Outputs and file formats
 
-The *Diagnostics & export* ZIP (and the command-line runner, which writes the CSVs) contains:
+*Data & downloads* offers every table separately as CSV and the whole run as one ZIP (the command-line runner writes the same files to a folder and also produces the ZIP). The ZIP contains:
 
 | File | Contents |
 |---|---|
+| `meta.json` | settings (K, seed, β, β_c, γ, runs, tolerances-independent run parameters), real-network scalars, generator keys/labels, node-map kinds, noise floor, failed generators (if any), timing of the run |
 | `scalar_metrics.csv` | real value and per-generator mean of every scalar structural metric |
 | `metric_errors.csv` | per-generator mean error (§5.2) for every scalar metric |
 | `fidelity.csv` | portrait divergence (mean, s.d.), degree KS / W₁ / JSD, clustering KS, edge overlap and overlap × chance |
 | `epidemic.csv` | final size, peak prevalence, time to peak, outbreak probability, and the functional errors (§7.5) |
 | `timing.csv` | fit/training time and per-graph generation time |
 | `structure_vs_function.csv` | one row per synthetic graph (§8.3) |
-| `synthetic/<generator>/graph_<i>.edgelist` | synthetic graphs, one `u v` pair per line, nodes `0..n-1` (ZIP only) |
+| `per_graph_metrics.csv` | one row per synthetic graph: all scalar metrics, β_c, portrait divergence, degree and clustering KS |
+| `epidemic_curves.csv` | per network and time: mean, 10th and 90th percentile of `I(t)` and `R(t)` (`network,time,I_mean,I_p10,I_p90,R_mean,R_p10,R_p90`) |
+| `epidemic_runs.csv` | per simulation run: `network,run,final_size,peak_prevalence,time_to_peak` |
+| `diagnostics.json` | NetGAN training history, LSM fitting losses and ρ, tuned SyNG-R privacy noise and its leakage probe, diffusion training time, configuration-model edge loss |
+| `real/real.edgelist` | the (cleaned) real network, one `u v` pair per line |
+| `synthetic/<generator>/graph_<i>.edgelist` | synthetic graphs, nodes `0..n-1` |
+| `synthetic/<generator>/node_map_<i>.txt` | synthetic node → real node (only where defined) |
 
-`examples/polblogs_results/` contains the CSV files of one complete run (political-blogs network, six generators).
+The first group (`scalar_metrics.csv` … `structure_vs_function.csv`) keeps the layout of earlier versions, so existing scripts that read them continue to work. Graph files are optional: *Download everything* can omit them, giving a small file that still opens in the dashboard, with the graph-dependent views disabled.
+
+**Reopening.** *Open saved results* accepts the ZIP, or any subset of these files uploaded together. Missing optional files only disable the views that need them; the minimum is the six summary tables.
+
+`examples/` contains `Les_Miserables_small.zip` (77 nodes, six generators, all graphs — use it to try the network explorer) and `Political_blogs_full.zip` (1,222 nodes, six generators), both openable with *Open saved results*; `examples/polblogs_results/` holds the same political-blogs run as plain files.
 
 ---
 
@@ -683,7 +728,7 @@ python scripts/run_experiment.py --input mynet.txt --out results/ \
        --generators er,ba,cm,netgan,syng_r --k 5 --max-nodes 1500 --seed 0 --netgan-iters 600
 ```
 
-Prints progress, the fidelity and epidemic tables and the key findings, and writes the CSV files to `--out`.
+Prints progress, the fidelity and epidemic tables and the key findings, and writes the complete export of §12 to `--out`, including `<name>_results.zip`, which opens directly in the dashboard (*Open saved results*).
 
 ### 13.2 Python
 
@@ -692,6 +737,7 @@ import networkx as nx
 from netsynth.io import load_graph, prepare_graph
 from netsynth.pipeline import ExperimentConfig, run_experiment
 from netsynth import reporting as rp
+from netsynth.bundle import bundle_from_result, bundle_to_zip, bundle_from_zip
 
 G0, _ = load_graph(open("net.txt", "rb").read(), "net.txt")
 G, info = prepare_graph(G0, take_lcc=True, max_nodes=1500)
@@ -699,11 +745,15 @@ G, info = prepare_graph(G0, take_lcc=True, max_nodes=1500)
 cfg = ExperimentConfig(generators=["er", "ba", "cm", "syng_r"], k=5, runs_per_graph=40)
 res = run_experiment(G, cfg, progress=lambda msg, frac: print(f"{frac:.0%} {msg}"))
 
-print(rp.fidelity_table(res))
-print(rp.sir_table(res))
-print(rp.verdicts(res, rp.Tolerances())[["simulation_ok", "sharing_ok"]])
-for line in rp.takeaways(res, rp.Tolerances()):
+b = bundle_from_result(res, "mynet")          # everything the dashboard shows
+print(b.fidelity)
+print(b.epidemic)
+print(rp.verdicts(b, rp.Tolerances())[["simulation_ok", "sharing_ok"]])
+for line in rp.takeaways(b, rp.Tolerances()):
     print("-", line)
+
+open("mynet_results.zip", "wb").write(bundle_to_zip(b))   # reopen later, or in the dashboard
+b2 = bundle_from_zip(open("mynet_results.zip", "rb").read())
 ```
 
 Single pieces can be used directly: `netsynth.portrait.portrait_divergence(G, H)`, `netsynth.structure.summarize(G)`, `netsynth.epidemic.simulate(G, SIRConfig(...))`, `syngler.api.SyNGLER`.
@@ -712,7 +762,7 @@ Single pieces can be used directly: `netsynth.portrait.portrait_divergence(G, H)
 
 ## 14. Testing and validation
 
-`pytest -q tests` runs 16 tests in a few seconds:
+`pytest -q tests` runs 23 tests in a few seconds:
 
 | Test | What it verifies |
 |---|---|
@@ -728,8 +778,14 @@ Single pieces can be used directly: `netsynth.portrait.portrait_divergence(G, H)
 | SIR | threshold finite, runs have the expected shape, final sizes in [0, 1] |
 | I/O | CSV edge list with header, `.gz`, adjacency CSV, `.npy`; directed + self-loop clean-up |
 | Failure isolation | a crashing generator is recorded while the others complete |
+| Bundle round-trip | a bundle written to ZIP and read back has the same tables, graphs, curves and runs; a graph-free export and a set of loose CSV files also load |
+| Verdicts and findings | verdict columns present, key findings produced from a bundle |
+| Leakage excess and effective tolerance | excess is 0 at chance and 1 for a copy; an epidemic tolerance is never below the noise floor |
+| SyNG-R latent noise | noise lowers edge copying and the density stays near the real density |
+| Plot builders | every chart function builds on a real small bundle |
+| Network views | pyvis HTML builds for every colour mode with copied-edge highlighting; snowball cap respected |
 
-The dashboard was additionally exercised through Streamlit's headless test harness and in a real browser, and a complete run of six generators on a 1,222-node network was executed end to end.
+The dashboard was additionally exercised through Streamlit's headless test harness (a fresh run and both bundled examples) and in a real browser, screenshotting every tab, and a complete run of six generators on a 1,222-node network was executed end to end.
 
 ---
 
@@ -764,7 +820,8 @@ Limits and guidance:
 * **Same-size synthetic graphs.** All generators produce graphs with the real node count. Behaviour for up- or down-scaling is not evaluated.
 * **One process.** SIR with a single β/γ pair probes one dynamical regime. Behaviour close to the critical point, other processes (SIS, threshold models, random-walk dynamics) and temporal networks may rank generators differently.
 * **Threshold reference.** `β_c` is a mean-field scale (§7.2); "twice the threshold" is not an exactly matched epidemic regime across graphs.
-* **Tolerances are subjective.** Defaults are heuristics and some were chosen after looking at typical values; report the tolerances with any verdict.
+* **Tolerances are subjective.** Defaults are heuristics and some were chosen after looking at typical values; report the tolerances with any verdict. The verdict gates on the degree distribution rather than on portrait divergence, a choice based on one network's correlation result — check it on yours.
+* **Privacy noise is a trade-off, not a guarantee.** Latent noise lowers edge copying and is tuned against the same overlap proxy it is measured with; it gives no differential-privacy guarantee, and structure such as clustering degrades as it grows.
 * **Leakage proxy.** Edge overlap measures exact-edge copying under a node map; it does not capture attribute inference, structural re-identification or formal privacy loss. SyNG-D has no map and is not assessed.
 * **Snowball artefacts.** Capped or benchmark sub-samples are biased towards the start node's neighbourhood.
 * **Sampled path statistics.** Average path length is estimated from ≤ 300 sources and diameter is a lower bound on large components.

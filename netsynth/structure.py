@@ -140,3 +140,58 @@ def edge_overlap(real: nx.Graph, edges: np.ndarray, node_map) -> float | None:
     n = real.number_of_nodes()
     A = _csr(real)
     return float(np.asarray(A[u[ok], v[ok]]).ravel().mean())
+
+
+# ----------------------------------------------------------------------------- profiles
+def _logbin(k: np.ndarray, v: np.ndarray, bins: int = 14):
+    """Mean of v per degree bin: exact degrees up to 8, log-spaced bins above."""
+    k, v = np.asarray(k), np.asarray(v, dtype=float)
+    m = k >= 1
+    k, v = k[m], v[m]
+    if len(k) == 0:
+        return np.array([]), np.array([])
+    kmax = int(k.max())
+    edges = np.unique(np.r_[np.arange(1, min(kmax, 8) + 1), np.round(np.geomspace(8, kmax + 1, bins)).astype(int)])
+    idx = np.digitize(k, edges, right=False)
+    xs, ys = [], []
+    for b in np.unique(idx):
+        sel = idx == b
+        xs.append(k[sel].mean()); ys.append(v[sel].mean())
+    return np.array(xs), np.array(ys)
+
+
+def node_profile(G: nx.Graph) -> dict:
+    """Per-node arrays used by the network-science profile plots."""
+    deg = degree_array(G)
+    nodes = list(G.nodes())
+    clu = clustering_array(G)
+    knn_d = nx.average_neighbor_degree(G)
+    knn = np.fromiter((knn_d[u] for u in nodes), dtype=float, count=len(nodes))
+    core_d = nx.core_number(G) if G.number_of_edges() else {u: 0 for u in nodes}
+    core = np.fromiter((core_d[u] for u in nodes), dtype=int, count=len(nodes))
+    return {"deg": deg, "clu": clu, "knn": knn, "core": core}
+
+
+def distance_histogram(G: nx.Graph, max_sources: int = 300, seed: int = 0) -> np.ndarray:
+    """Share of node pairs (from sampled BFS sources, largest component) at each distance 1, 2, ..."""
+    A = _csr(G)
+    keep = lcc_nodes(G)
+    if len(keep) < 2:
+        return np.zeros(1)
+    A = A[keep][:, keep]
+    rng = np.random.default_rng(seed)
+    src = np.arange(len(keep)) if len(keep) <= max_sources else rng.choice(len(keep), max_sources, replace=False)
+    D = shortest_path(A, method="D", directed=False, unweighted=True, indices=src)
+    D = D[np.isfinite(D) & (D > 0)].astype(int)
+    h = np.bincount(D)[1:].astype(float)
+    return h / h.sum() if h.sum() else h
+
+
+def pooled_profile(graphs: list, seed: int = 0) -> dict:
+    """Pool node profiles / distance histograms over several graphs of one generator."""
+    parts = [node_profile(G) for G in graphs]
+    cat = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+    hists = [distance_histogram(G, seed=seed) for G in graphs]
+    L = max(len(h) for h in hists)
+    hist = np.mean([np.pad(h, (0, L - len(h))) for h in hists], axis=0)
+    return {**cat, "dist_hist": hist}

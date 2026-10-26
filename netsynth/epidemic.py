@@ -105,3 +105,5 @@ def noise_floor(real: dict, rng: np.random.Generator) -> dict:
     A, B = pick(real, a), pick(real, b)
     A["outbreak_prob"] = float((A["final"] > 0.05).mean()); B["outbreak_prob"] = float((B["final"] > 0.05).mean())
     return compare_to_real(A, B)
+
+

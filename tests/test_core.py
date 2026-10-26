@@ -129,3 +129,79 @@ def test_pipeline_survives_generator_failure(monkeypatch):
     res = pipeline.run_experiment(nx.karate_club_graph(),
                                   pipeline.ExperimentConfig(generators=["er", "netgan", "cm"], k=2, runs_per_graph=5))
     assert res.reports["netgan"].ok is False and res.reports["er"].ok and res.reports["cm"].ok
+
+
+# ----------------------------------------------------------------------------- dashboard data layer
+@pytest.fixture(scope="module")
+def small_bundle():
+    from netsynth.bundle import bundle_from_result
+    from netsynth.pipeline import ExperimentConfig, run_experiment
+    G = nx.convert_node_labels_to_integers(nx.connected_watts_strogatz_graph(80, 6, 0.1, seed=3))
+    res = run_experiment(G, ExperimentConfig(generators=["er", "cm", "syng_r"], k=2, runs_per_graph=8,
+                                             gen_params=dict(n_iter_init=40, n_iter_refine=20)))
+    return bundle_from_result(res, "ws")
+
+
+def test_bundle_zip_roundtrip(small_bundle):
+    from netsynth.bundle import bundle_from_zip, bundle_to_zip
+    b2 = bundle_from_zip(bundle_to_zip(small_bundle), "x")
+    assert b2.has_graphs and list(b2.fidelity.index) == list(small_bundle.fidelity.index)
+    assert b2.real.number_of_edges() == small_bundle.real.number_of_edges()
+    assert b2.curves is not None and b2.runs is not None
+    np.testing.assert_allclose(b2.epidemic.select_dtypes("number").fillna(0).values,
+                               small_bundle.epidemic.select_dtypes("number").fillna(0).values, atol=1e-6)
+
+
+def test_bundle_without_graphs_and_from_csv_files(small_bundle):
+    from netsynth.bundle import bundle_files, bundle_from_files
+    files = {k: v for k, v in bundle_files(small_bundle, include_graphs=False).items()}
+    b = bundle_from_files({k.split("/")[-1]: (v if isinstance(v, bytes) else v.encode()) for k, v in files.items()})
+    assert not b.has_graphs and len(b.fidelity) == 3
+
+
+def test_verdicts_and_takeaways(small_bundle):
+    from netsynth import reporting as rp
+    v = rp.verdicts(small_bundle, rp.Tolerances())
+    assert {"simulation_ok", "sharing_ok"} <= set(v.columns) and len(v) == 3
+    assert rp.takeaways(small_bundle, rp.Tolerances())
+
+
+def test_all_plots_build(small_bundle):
+    from netsynth import plots
+    from netsynth.structure import pooled_profile
+    b, cm = small_bundle, plots.color_map(small_bundle)
+    profs = {"Real": pooled_profile([b.real])}
+    profs.update({g["label"]: pooled_profile(b.graphs[g["key"]]) for g in b.generators})
+    figs = [plots.scalar_small_multiples(b), plots.pd_figure(b), plots.epidemic_curves(b, "I", False, [g["label"] for g in b.generators]),
+            plots.epidemic_bars(b), plots.epidemic_errors(b, __import__("netsynth.reporting", fromlist=["x"]).Tolerances()),
+            plots.leakage_bars(b, 0.2), plots.timing_fig(b), plots.degree_ccdf_fig(profs, cm), plots.clustering_box(profs, cm)]
+    assert all(f is not None for f in figs)
+
+
+def test_netviz_html_and_sampling():
+    from netsynth import netviz
+    G = nx.convert_node_labels_to_integers(nx.karate_club_graph())
+    for mode in netviz.COLOR_MODES:
+        html, legend, n = netviz.network_html(G, mode, lambda u, v: u < 3)
+        assert "vis" in html and n > 0
+    Gs, sampled = netviz.viz_subgraph(nx.barabasi_albert_graph(500, 3, seed=1), 120)
+    assert sampled and Gs.number_of_nodes() <= 120
+
+
+def test_leak_excess_and_effective_tolerance(small_bundle):
+    from netsynth import reporting as rp
+    assert rp.leak_excess(0.1, 1.0) == 0.0                       # overlap equal to chance -> no excess
+    assert abs(rp.leak_excess(1.0, 10.0) - 1.0) < 1e-9           # every edge real -> full excess
+    et = rp.effective_tolerances(small_bundle, rp.Tolerances(curve_nrmse=0.0))
+    assert et["curve"] >= small_bundle.floor["curve_nrmse"]      # never tighter than the noise floor
+
+
+def test_syngler_latent_noise_lowers_copying():
+    from syngler.api import SyNGLER
+    from netsynth.structure import edge_overlap
+    G = nx.convert_node_labels_to_integers(nx.les_miserables_graph())
+    m = SyNGLER(r=6, n_iter_init=150, n_iter_refine=150).fit(G)
+    ov = lambda ln: np.mean([edge_overlap(G, s.edges, s.node_map) for s in m.sample(6, latent_noise=ln)])
+    assert ov(1.5) < ov(0.0) - 0.1
+    smp = m.sample(1, latent_noise=1.0)[0]
+    assert abs(len(smp.edges) - G.number_of_edges()) < 0.4 * G.number_of_edges()   # density is re-calibrated

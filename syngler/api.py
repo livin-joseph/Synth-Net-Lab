@@ -28,7 +28,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.special import expit
 
-from syngler.fit import LSMFit, fit_lsm
+from syngler.fit import LSMFit, _calibrate_rho, fit_lsm
 
 
 @dataclass
@@ -103,8 +103,14 @@ class SyNGLER:
 
     # ---------------------------------------------------------------- stage 2
     def sample(self, k: int = 1, method: str = "res", seed: Optional[int] = None,
-               mlp_steps: int = 2000, forest_kw: Optional[dict] = None) -> list:
+               mlp_steps: int = 2000, forest_kw: Optional[dict] = None, latent_noise: float = 0.0) -> list:
         """Draw ``k`` synthetic graphs.
+
+        latent_noise (SyNG-R only): standard deviation, in units of the spread of the fitted latents, of Gaussian
+        jitter added to the resampled (Z, alpha), rescaled by 1/sqrt(1+sigma^2) so the spread (and with it the degree heterogeneity) is preserved.  The fitted model can be nearly deterministic on small graphs
+        (edge probabilities close to 0/1 for real edges), which makes SyNG-R copy real edges.  Jitter smooths
+        this; the intercept rho is re-calibrated per graph so the expected density stays equal to the real one.
+        0 reproduces plain SyNG-R.
 
         method = "res"          bootstrap-resample (Z, alpha)  (SyNG-R, no extra training)
                  "diff-mlp"     DDPM over (Z, alpha), trained once on CPU/GPU
@@ -120,7 +126,13 @@ class SyNGLER:
                 t0 = time.perf_counter()
                 rng = np.random.default_rng([seed, b])
                 idx = rng.integers(0, f.n, size=f.n)                 # bootstrap nodes
-                edges = sample_edges_from_latents(f.Z[idx], f.alpha[idx], f.rho, rng)
+                Zb, ab, rho = f.Z[idx], f.alpha[idx], f.rho
+                if latent_noise > 0:
+                    sc = 1.0 / np.sqrt(1.0 + latent_noise ** 2)      # variance-preserving: keeps the degree spread
+                    Zb = sc * (Zb + latent_noise * f.Z.std(axis=0, keepdims=True) * rng.standard_normal(Zb.shape))
+                    ab = sc * (ab + latent_noise * f.alpha.std() * rng.standard_normal(ab.shape))
+                    rho = _calibrate_rho(Zb @ Zb.T + ab[:, None] + ab[None, :], f.density)
+                edges = sample_edges_from_latents(Zb, ab, rho, rng)
                 out.append(SyntheticSample(f.n, edges, node_map=idx, seconds=time.perf_counter() - t0))
             return out
 
